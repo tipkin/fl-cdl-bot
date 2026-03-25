@@ -157,25 +157,41 @@ async def parse_ct_result(page):
 
         parts = []
 
-        # Search line by line to avoid cross-line regex confusion
-        lines = (await page.inner_text("body")).splitlines()
-        lines = [l.strip() for l in lines if l.strip()]
+        # The result table only appears after "Connecticut Credential No:"
+        # Everything before that is disclaimer text — skip it to avoid false matches
+        all_lines = (await page.inner_text("body")).splitlines()
+        all_lines = [l.strip() for l in all_lines if l.strip()]
+
+        # Find where the result section starts
+        result_start = 0
+        for i, line in enumerate(all_lines):
+            if re.search(r"Connecticut Credential No", line, re.I):
+                result_start = i
+                break
+
+        result_lines = all_lines[result_start:] if result_start else all_lines
 
         def find_field_value(keyword):
-            """Find a line containing keyword and return the value after the last colon."""
-            for line in lines:
-                if keyword.lower() in line.lower():
-                    # value is after the last colon on the line
-                    if ":" in line:
-                        val = line.rsplit(":", 1)[-1].strip()
-                        if val:
-                            return val
+            """
+            In the result section, find a short line (< 80 chars) containing
+            the keyword where the value after the last colon is a known status
+            word or short token. This avoids matching long disclaimer sentences.
+            """
+            known_values = {"VALID", "SUSPENDED", "REVOKED", "CANCELLED",
+                            "DISQUALIFIED", "N/A", "Y", "N"}
+            for line in result_lines:
+                if len(line) > 120:          # skip long disclaimer sentences
+                    continue
+                if keyword.lower() in line.lower() and ":" in line:
+                    val = line.rsplit(":", 1)[-1].strip()
+                    if val:
+                        return val
             return None
 
         # ── CDL status ────────────────────────────────────────
-        cdl_status = find_field_value("Commercial Driver License")
-        if cdl_status:
-            s = cdl_status.upper()
+        cdl_val = find_field_value("Commercial Driver License")
+        if cdl_val:
+            s = cdl_val.upper()
             if s == "VALID":
                 parts.append("\u2705 CDL STATUS: VALID \u2705")
             elif s == "N/A":
@@ -183,7 +199,8 @@ async def parse_ct_result(page):
             else:
                 parts.append(f"\U0001f6a8 CDL STATUS: {s} \U0001f6a8")
         else:
-            if re.search(r"\bVALID\b", text):
+            # Last resort fallback
+            if any("VALID" in l for l in result_lines):
                 parts.append("\u2705 STATUS: VALID \u2705")
             else:
                 parts.append("\u26a0\ufe0f STATUS: UNKNOWN — check screenshot")
