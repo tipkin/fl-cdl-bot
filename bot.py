@@ -39,7 +39,7 @@ STATES = {
     "CT": {
         "url": "https://www.dmvselfservice.ct.gov/LicenseStatusService.aspx?language=en_US",
         # Confirmed from page source:
-        "dl_input":       ["input#txtDriverLicence"],          # note: "Licence" typo is correct
+        "dl_input":       ["input#txtDriverLicence", "input[name*='txtDriverLicence']"],
         "captcha_img":    ["img[src*='CaptchaImage.axd' i]"],
         "captcha_input":  ["input#ctl00_contentplaceholder_txtCap"],
         "submit":         ["input#ctl00_contentplaceholder_cmdSubmit"],
@@ -143,24 +143,71 @@ async def parse_ct_result(page):
     try:
         text = " ".join(l.strip() for l in (await page.inner_text("body")).splitlines() if l.strip())
 
+        # Detect if still on form page (submission failed)
+        if re.search(r"Enter Credential Number!", text, re.I):
+            return (
+                "\u274c FORM NOT SUBMITTED\n"
+                "Possible causes: CAPTCHA wrong, DL field not filled, or terms not checked.\n"
+                "Check screenshot."
+            )
+
+        # Not found
         if re.search(r"(not found|no record|invalid credential|does not exist)", text, re.I):
-            status = "\u274c STATUS: NOT FOUND / INVALID NUMBER"
-        elif re.search(r"\bvalid\b", text, re.I) and not re.search(r"\b(suspended|revoked|cancelled|disqualified)\b", text, re.I):
-            status = "\u2705 STATUS: VALID \u2705"
-        elif re.search(r"\b(suspended|revoked|cancelled|disqualified)\b", text, re.I):
-            status = "\U0001f6a8 STATUS: INVALID / ACTION REQUIRED \U0001f6a8"
+            return "\u274c STATUS: NOT FOUND / INVALID NUMBER"
+
+        parts = []
+
+        # ── CDL status (most important for truckers) ──────────
+        cdl_match = re.search(r"Commercial Driver License.*?:\s*(VALID|SUSPENDED|REVOKED|CANCELLED|DISQUALIFIED|N/A)", text, re.I)
+        if cdl_match:
+            cdl_status = cdl_match.group(1).upper()
+            if cdl_status == "VALID":
+                parts.append("\u2705 CDL STATUS: VALID \u2705")
+            elif cdl_status == "N/A":
+                parts.append("\u26a0\ufe0f CDL STATUS: N/A (no CDL on record)")
+            else:
+                parts.append(f"\U0001f6a8 CDL STATUS: {cdl_status} \U0001f6a8")
         else:
-            status = "\u26a0\ufe0f STATUS: UNKNOWN"
+            # Fallback: check for any VALID/invalid in result area
+            if re.search(r"\bVALID\b", text):
+                parts.append("\u2705 STATUS: VALID \u2705")
+            elif re.search(r"\b(SUSPENDED|REVOKED|CANCELLED|DISQUALIFIED)\b", text):
+                parts.append("\U0001f6a8 STATUS: INVALID / ACTION REQUIRED \U0001f6a8")
+            else:
+                parts.append("\u26a0\ufe0f STATUS: UNKNOWN — check screenshot")
 
-        parts = [status]
-        m = re.search(r"[Ee]xpir\w+[:\s]+(\d{1,2}/\d{1,2}/\d{4})", text)
-        if m: parts.append(f"Expires: {m.group(1)}")
-        m = re.search(r"[Cc]lass[:\s]+([A-D]\b)", text)
-        if m: parts.append(f"Class: {m.group(1)}")
-        m = re.search(r"[Ee]ndorsement[s]?[:\s]+([A-Z0-9, ]+)", text)
-        if m: parts.append(f"Endorsements: {m.group(1).strip()}")
+        # ── Class D (non-commercial) ──────────────────────────
+        classD = re.search(r"Class D License.*?:\s*(VALID|SUSPENDED|REVOKED|CANCELLED|N/A)", text, re.I)
+        if classD and classD.group(1).upper() != "N/A":
+            parts.append(f"Class D: {classD.group(1).upper()}")
 
-        return "\n".join(parts)
+        # ── Endorsements ──────────────────────────────────────
+        endo = re.search(r"Endorsement\(s\)\s*:\s*([A-Z0-9, ]+?)(?:\s*Endorsement|\s*Medical|\s*Self|$)", text)
+        if endo:
+            val = endo.group(1).strip()
+            if val and val.upper() != "N/A":
+                parts.append(f"Endorsements: {val}")
+
+        # ── Medical cert ──────────────────────────────────────
+        med_cert = re.search(r"Medical Certificate Expiration Date\s*:?\s*(\d{1,2}/\d{2}/\d{4})", text, re.I)
+        if med_cert:
+            parts.append(f"Med Cert Exp: {med_cert.group(1)}")
+
+        certified = re.search(r"Certified\s*:([YN])", text, re.I)
+        if certified:
+            parts.append(f"Med Certified: {certified.group(1).upper()}")
+
+        # ── Self-certification ────────────────────────────────
+        selfcert = re.search(r"SelfCertification Category\s*:\s*([A-Z \-]+?)(?:\s+SelfCertification Date|$)", text, re.I)
+        if selfcert:
+            parts.append(f"Self-Cert: {selfcert.group(1).strip()}")
+
+        selfcert_date = re.search(r"SelfCertification Date\s*:\s*(\d{1,2}/\d{2}/\d{4})", text, re.I)
+        if selfcert_date:
+            parts.append(f"Self-Cert Date: {selfcert_date.group(1)}")
+
+        return "\n".join(parts) if parts else "\u26a0\ufe0f Could not parse CT result — check screenshot"
+
     except Exception as e:
         logger.error(f"CT parse error: {e}")
         return "\u26a0\ufe0f Could not parse CT result — check screenshot"
@@ -196,7 +243,11 @@ async def check_cdl(driver_name, cdl_number, state, update):
             if not dl_input:
                 await update.message.reply_text(f"\u274c {state} {cdl_number}: DL input not found. Run /debug{state.lower()}")
                 return
-            await dl_input.fill(cdl_number)
+            await dl_input.scroll_into_view_if_needed()
+            await dl_input.click()
+            await dl_input.fill("")
+            await dl_input.type(cdl_number, delay=50)
+            logger.info(f"Filled DL number: {cdl_number}")
 
             # 2. Terms checkbox (CT only)
             if cfg["agree_checkbox"]:
