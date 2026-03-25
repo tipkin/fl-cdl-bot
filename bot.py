@@ -42,50 +42,29 @@ solver = TwoCaptcha(CAPTCHA_API_KEY)
 #  After running /debug, paste the confirmed selector at [0]
 # ─────────────────────────────────────────────────────────────
 DL_INPUT_SELECTORS = [
-    # ── Confirmed new-portal selector (fill in after /debug) ──
-    # "input#NEW_ID",
-    # ── Legacy ────────────────────────────────────────────────
-    "input#MainContent_txtDLNumber",
-    "input#txtDLNumber",
-    "input[name='DLNumber']",
-    "input[name='dlNumber']",
+    "input#DLNumber",
+    "input[name='DriverLicenseNumber']",
     "input[placeholder*='License' i]",
-    "input[id*='DLNumber' i]",
-    "input[id*='dlnumber' i]",
 ]
 
 CAPTCHA_IMG_SELECTORS = [
-    # ── Confirmed new-portal selector (fill in after /debug) ──
-    # "img.NEW_CLASS",
-    # ── Legacy ────────────────────────────────────────────────
+    "img#dlCheckCaptcha_CaptchaImage",
     "img.LBD_CaptchaImage",
+    "img[src*='BotDetectCaptcha' i]",
     "img[src*='captcha' i]",
-    "img[id*='captcha' i]",
-    "img[class*='captcha' i]",
 ]
 
 CAPTCHA_INPUT_SELECTORS = [
-    # ── Confirmed new-portal selector (fill in after /debug) ──
-    # "input#NEW_ID",
-    # ── Legacy ────────────────────────────────────────────────
-    "input#MainContent_txtCaptchaCode",
-    "input#txtCaptchaCode",
+    "input#CaptchaCode",
+    "input[name='CaptchaCode']",
     "input[id*='captcha' i]",
     "input[name*='captcha' i]",
-    "input[placeholder*='captcha' i]",
 ]
 
 SUBMIT_SELECTORS = [
-    # ── Confirmed new-portal selector (fill in after /debug) ──
-    # "input#NEW_ID",
-    # ── Legacy ────────────────────────────────────────────────
-    "input#MainContent_btnEnter",
-    "input#btnEnter",
-    "input[type='submit']",
+    "button#continueButton",
     "button[type='submit']",
-    "button:has-text('Enter')",
-    "button:has-text('Check')",
-    "button:has-text('Submit')",
+    "button:has-text('Continue')",
 ]
 
 # ─────────────────────────────────────────────────────────────
