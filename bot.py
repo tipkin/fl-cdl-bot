@@ -157,36 +157,46 @@ async def parse_ct_result(page):
 
         parts = []
 
-        # ── CDL status (most important for truckers) ──────────
-        cdl_match = re.search(r"Commercial Driver License.*?:\s*(VALID|SUSPENDED|REVOKED|CANCELLED|DISQUALIFIED|N/A)", text, re.I)
-        if cdl_match:
-            cdl_status = cdl_match.group(1).upper()
-            if cdl_status == "VALID":
+        # Search line by line to avoid cross-line regex confusion
+        lines = (await page.inner_text("body")).splitlines()
+        lines = [l.strip() for l in lines if l.strip()]
+
+        def find_field_value(keyword):
+            """Find a line containing keyword and return the value after the last colon."""
+            for line in lines:
+                if keyword.lower() in line.lower():
+                    # value is after the last colon on the line
+                    if ":" in line:
+                        val = line.rsplit(":", 1)[-1].strip()
+                        if val:
+                            return val
+            return None
+
+        # ── CDL status ────────────────────────────────────────
+        cdl_status = find_field_value("Commercial Driver License")
+        if cdl_status:
+            s = cdl_status.upper()
+            if s == "VALID":
                 parts.append("\u2705 CDL STATUS: VALID \u2705")
-            elif cdl_status == "N/A":
+            elif s == "N/A":
                 parts.append("\u26a0\ufe0f CDL STATUS: N/A (no CDL on record)")
             else:
-                parts.append(f"\U0001f6a8 CDL STATUS: {cdl_status} \U0001f6a8")
+                parts.append(f"\U0001f6a8 CDL STATUS: {s} \U0001f6a8")
         else:
-            # Fallback: check for any VALID/invalid in result area
             if re.search(r"\bVALID\b", text):
                 parts.append("\u2705 STATUS: VALID \u2705")
-            elif re.search(r"\b(SUSPENDED|REVOKED|CANCELLED|DISQUALIFIED)\b", text):
-                parts.append("\U0001f6a8 STATUS: INVALID / ACTION REQUIRED \U0001f6a8")
             else:
                 parts.append("\u26a0\ufe0f STATUS: UNKNOWN — check screenshot")
 
         # ── Class D (non-commercial) ──────────────────────────
-        classD = re.search(r"Class D License.*?:\s*(VALID|SUSPENDED|REVOKED|CANCELLED|N/A)", text, re.I)
-        if classD and classD.group(1).upper() != "N/A":
-            parts.append(f"Class D: {classD.group(1).upper()}")
+        classD_val = find_field_value("Class D License")
+        if classD_val and classD_val.upper() != "N/A":
+            parts.append(f"Class D: {classD_val.upper()}")
 
         # ── Endorsements ──────────────────────────────────────
-        endo = re.search(r"Endorsement\(s\)\s*:\s*([A-Z0-9, ]+?)(?:\s*Endorsement|\s*Medical|\s*Self|$)", text)
-        if endo:
-            val = endo.group(1).strip()
-            if val and val.upper() != "N/A":
-                parts.append(f"Endorsements: {val}")
+        endo_val = find_field_value("Endorsement(s)")
+        if endo_val and endo_val.upper() not in ("N/A", ""):
+            parts.append(f"Endorsements: {endo_val}")
 
         # ── Medical cert ──────────────────────────────────────
         med_cert = re.search(r"Medical Certificate Expiration Date\s*:?\s*(\d{1,2}/\d{2}/\d{4})", text, re.I)
