@@ -1,29 +1,22 @@
 import logging
 import os
 import re
-import time
 import tempfile
 from datetime import datetime
 
-import pytesseract
-from PIL import Image
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 from twocaptcha import TwoCaptcha
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# ─────────────────────────────────────────────────────────────
-#  LOGGING
-# ─────────────────────────────────────────────────────────────
+# LOGGING
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
-# ─────────────────────────────────────────────────────────────
-#  CONFIG  (set as Railway env vars — never commit real values)
-# ─────────────────────────────────────────────────────────────
+# CONFIG
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CAPTCHA_API_KEY    = os.environ["CAPTCHA_API_KEY"]
 
@@ -37,10 +30,7 @@ DL_CHECK_URL = "https://mydmvportal.flhsmv.gov/home/en/publicweb/dlcheck"
 
 solver = TwoCaptcha(CAPTCHA_API_KEY)
 
-# ─────────────────────────────────────────────────────────────
-#  SELECTOR LISTS  (ranked: most-likely-correct first)
-#  After running /debug, paste the confirmed selector at [0]
-# ─────────────────────────────────────────────────────────────
+# CONFIRMED SELECTORS
 DL_INPUT_SELECTORS = [
     "input#DLNumber",
     "input[name='DriverLicenseNumber']",
@@ -67,11 +57,15 @@ SUBMIT_SELECTORS = [
     "button:has-text('Continue')",
 ]
 
-# ─────────────────────────────────────────────────────────────
-#  BROWSER HELPERS
-# ─────────────────────────────────────────────────────────────
-async def find_first(page, selectors: list[str], timeout: int = 8000):
-    """Return the first locator that resolves within timeout ms."""
+RECAPTCHA_SELECTORS = [
+    ".g-recaptcha",
+    "[data-sitekey]",
+    "iframe[src*='recaptcha']",
+]
+
+
+# BROWSER HELPERS
+async def find_first(page, selectors, timeout=8000):
     for sel in selectors:
         try:
             loc = page.locator(sel).first
@@ -83,9 +77,8 @@ async def find_first(page, selectors: list[str], timeout: int = 8000):
     return None
 
 
-async def detect_recaptcha(page) -> str | None:
-    """Return reCAPTCHA site-key if present, else None."""
-    for sel in [".g-recaptcha", "[data-sitekey]", "iframe[src*='recaptcha']"]:
+async def detect_recaptcha(page):
+    for sel in RECAPTCHA_SELECTORS:
         try:
             el = page.locator(sel).first
             await el.wait_for(state="attached", timeout=3000)
@@ -101,10 +94,8 @@ async def detect_recaptcha(page) -> str | None:
     return None
 
 
-# ─────────────────────────────────────────────────────────────
-#  CAPTCHA SOLVERS
-# ─────────────────────────────────────────────────────────────
-def solve_image_captcha(image_path: str) -> str | None:
+# CAPTCHA SOLVERS
+def solve_image_captcha(image_path):
     try:
         result = solver.normal(image_path)
         logger.info(f"Image CAPTCHA solved: {result['code']}")
@@ -114,7 +105,7 @@ def solve_image_captcha(image_path: str) -> str | None:
         return None
 
 
-def solve_recaptcha_v2(site_key: str, page_url: str) -> str | None:
+def solve_recaptcha_v2(site_key, page_url):
     try:
         result = solver.recaptcha(sitekey=site_key, url=page_url)
         logger.info("reCAPTCHA v2 solved")
@@ -124,51 +115,65 @@ def solve_recaptcha_v2(site_key: str, page_url: str) -> str | None:
         return None
 
 
-# ─────────────────────────────────────────────────────────────
-#  OCR + RESULT PARSER
-# ─────────────────────────────────────────────────────────────
-def extract_text(path: str) -> str:
+# RESULT PAGE PARSER - reads HTML directly, no OCR needed
+async def parse_result_page(page):
     try:
-        return pytesseract.image_to_string(Image.open(path), lang="eng")
-    except Exception as e:
-        logger.error(f"OCR error: {e}")
-        return ""
+        body = await page.inner_text("body")
+        lines = [l.strip() for l in body.splitlines() if l.strip()]
+        text = " ".join(lines)
 
+        is_valid = bool(re.search(r"\bis\s+valid\b", text, re.I))
+        is_bad = bool(re.search(
+            r"\b(cancelled|suspended|revoked|disqualified|withdrawn)\b", text, re.I
+        ))
 
-def parse_result(raw: str) -> str:
-    lines = [l.strip() for l in raw.splitlines() if l.strip()]
-    if not lines:
-        return "ℹ️ OCR: empty result"
+        if is_valid:
+            status_emoji = "\u2705 STATUS: VALID \u2705"
+        elif is_bad:
+            status_emoji = "\U0001f6a8 STATUS: INVALID / ACTION REQUIRED \U0001f6a8"
+        else:
+            status_emoji = "\u26a0\ufe0f STATUS: UNKNOWN"
 
-    if any("VALID" in l.upper() for l in lines):
-        return "✅ STATUS: VALID ✅"
+        parts = [status_emoji]
 
-    dates = []
-    for line in lines:
-        m = re.search(r"\d{1,2}/\d{1,2}/\d{4}", line)
+        m = re.search(r"Class\s+(\w+)", text, re.I)
         if m:
-            dates.append(f"  {m.group(0)}")
+            parts.append(f"Class: {m.group(1)}")
 
-    if dates:
-        return "🚨 STATUS: UPCOMING ACTION 🚨\n" + "\n".join(dates)
+        m = re.search(r"expiration date of (\d{2}/\d{2}/\d{4})", text, re.I)
+        if m:
+            parts.append(f"Expires: {m.group(1)}")
 
-    return "ℹ️ Status not detected\n\nRaw OCR:\n" + "\n".join(lines[:12])
+        m = re.search(r"Medical Certification Expiration Date[:\s]+(\d{2}/\d{2}/\d{4})", text, re.I)
+        if m:
+            parts.append(f"Med Cert Exp: {m.group(1)}")
+
+        issue_sections = [
+            "Effective Insurance Cancellation Suspensions",
+            "Court Suspension",
+            "Suspensions, Revocations, Cancellations, Disqualifications",
+        ]
+        for section in issue_sections:
+            pattern = re.escape(section) + r".{0,300}"
+            sm = re.search(pattern, text, re.I | re.DOTALL)
+            if sm and "None on Record" not in sm.group(0):
+                parts.append(f"\u26a0\ufe0f {section}: see screenshot")
+
+        return "\n".join(parts)
+
+    except Exception as e:
+        logger.error(f"Page parse error: {e}")
+        return "\u26a0\ufe0f Could not parse result page — check screenshot"
 
 
-# ─────────────────────────────────────────────────────────────
-#  CORE CHECK
-# ─────────────────────────────────────────────────────────────
-async def check_cdl(driver_name: str, cdl_number: str, update: Update):
+# CORE CHECK
+async def check_cdl(driver_name, cdl_number, update):
     result_path = None
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
             headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-gpu",
-                "--disable-dev-shm-usage",
-            ],
+            args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"],
         )
         context = await browser.new_context(
             viewport={"width": 1280, "height": 900},
@@ -178,45 +183,38 @@ async def check_cdl(driver_name: str, cdl_number: str, update: Update):
                 "Chrome/120.0.0.0 Safari/537.36"
             ),
         )
-        # Mask automation flag
         await context.add_init_script(
             "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
         )
         page = await context.new_page()
 
         try:
-            # ── 1. Load ──────────────────────────────────────
+            # 1. Load page
             await page.goto(DL_CHECK_URL, wait_until="networkidle", timeout=30000)
 
-            # ── 2. DL number ─────────────────────────────────
+            # 2. Enter DL number
             dl_input = await find_first(page, DL_INPUT_SELECTORS)
             if not dl_input:
                 await update.message.reply_text(
-                    f"❌ {cdl_number}: поле ввода номера не найдено.\n"
-                    "Запустите /debug для диагностики."
+                    f"\u274c {cdl_number}: DL input field not found. Run /debug."
                 )
                 return
             await dl_input.fill(cdl_number)
 
-            # ── 3. CAPTCHA ───────────────────────────────────
+            # 3. CAPTCHA
             recaptcha_key = await detect_recaptcha(page)
 
             if recaptcha_key:
                 token = solve_recaptcha_v2(recaptcha_key, DL_CHECK_URL)
                 if not token:
-                    await update.message.reply_text(f"❌ {cdl_number}: reCAPTCHA не решена")
+                    await update.message.reply_text(f"\u274c {cdl_number}: reCAPTCHA failed")
                     return
                 await page.evaluate(
-                    f"""
-                    document.getElementById('g-recaptcha-response').innerHTML = '{token}';
-                    var cb = document.querySelector('.g-recaptcha')?.getAttribute('data-callback');
-                    if (cb && window[cb]) window[cb]('{token}');
-                    """
+                    f"document.getElementById('g-recaptcha-response').innerHTML = '{token}';"
                 )
             else:
                 captcha_img = await find_first(page, CAPTCHA_IMG_SELECTORS, timeout=5000)
                 if captcha_img:
-                    # Reload captcha image
                     await page.evaluate(
                         "el => el.src = el.src + '&r=' + Math.random()",
                         await captcha_img.element_handle(),
@@ -228,40 +226,37 @@ async def check_cdl(driver_name: str, cdl_number: str, update: Update):
                     await captcha_img.screenshot(path=captcha_path)
                     captcha_text = solve_image_captcha(captcha_path)
                     if not captcha_text:
-                        await update.message.reply_text(f"❌ {cdl_number}: капча не решена")
+                        await update.message.reply_text(f"\u274c {cdl_number}: CAPTCHA not solved")
                         return
 
                     cap_input = await find_first(page, CAPTCHA_INPUT_SELECTORS)
                     if not cap_input:
                         await update.message.reply_text(
-                            f"❌ {cdl_number}: поле капчи не найдено.\n"
-                            "Запустите /debug для диагностики."
+                            f"\u274c {cdl_number}: CAPTCHA input not found. Run /debug."
                         )
                         return
                     await cap_input.fill(captcha_text)
                 else:
-                    logger.warning("No CAPTCHA element found — continuing without it")
+                    logger.warning("No CAPTCHA found — continuing")
 
-            # ── 4. Submit ────────────────────────────────────
+            # 4. Submit
             submit = await find_first(page, SUBMIT_SELECTORS)
             if not submit:
                 await update.message.reply_text(
-                    f"❌ {cdl_number}: кнопка Submit не найдена.\n"
-                    "Запустите /debug для диагностики."
+                    f"\u274c {cdl_number}: Submit button not found. Run /debug."
                 )
                 return
             await submit.click()
             await page.wait_for_timeout(3000)
 
-            # ── 5. Screenshot + OCR ──────────────────────────
+            # 5. Screenshot + parse HTML directly
             result_path = os.path.join(tempfile.gettempdir(), f"result_{cdl_number}.png")
             await page.screenshot(path=result_path, full_page=False)
 
-            ocr_raw = extract_text(result_path)
-            parsed  = parse_result(ocr_raw)
+            parsed = await parse_result_page(page)
 
             caption = (
-                f"👤 {driver_name} 👤\n"
+                f"\U0001f464 {driver_name} \U0001f464\n"
                 f"{cdl_number}\n"
                 f"{datetime.now().strftime('%m/%d/%Y')}\n\n"
                 f"{parsed}"
@@ -271,20 +266,18 @@ async def check_cdl(driver_name: str, cdl_number: str, update: Update):
 
         except Exception as e:
             logger.error(f"Error for {cdl_number}: {e}", exc_info=True)
-            await update.message.reply_text(f"⚠️ {cdl_number} ошибка: {e}")
+            await update.message.reply_text(f"\u26a0\ufe0f {cdl_number} error: {e}")
         finally:
             await browser.close()
             if result_path and os.path.exists(result_path):
                 os.remove(result_path)
 
 
-# ─────────────────────────────────────────────────────────────
-#  /debug  — page screenshot + full element dump
-# ─────────────────────────────────────────────────────────────
+# /debug COMMAND
 async def debug_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if getattr(update.effective_user, "id", None) not in ALLOWED_IDS:
         return
-    await update.message.reply_text("🔍 Загружаю страницу...")
+    await update.message.reply_text("\U0001f50d Loading page for diagnostics...")
 
     debug_path = os.path.join(tempfile.gettempdir(), "debug.png")
 
@@ -301,8 +294,7 @@ async def debug_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
             rckey   = await detect_recaptcha(page)
 
             lines = [f"URL: {page.url}", ""]
-
-            lines.append("── INPUTS ──")
+            lines.append("-- INPUTS --")
             for el in inputs[:25]:
                 lines.append(
                     f"  id='{await el.get_attribute('id')}' "
@@ -310,16 +302,14 @@ async def debug_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"type='{await el.get_attribute('type')}' "
                     f"placeholder='{await el.get_attribute('placeholder')}'"
                 )
-
-            lines.append("\n── BUTTONS ──")
+            lines.append("\n-- BUTTONS --")
             for el in buttons[:10]:
                 lines.append(
                     f"  id='{await el.get_attribute('id')}' "
                     f"type='{await el.get_attribute('type')}' "
                     f"text='{(await el.inner_text())[:40]}'"
                 )
-
-            lines.append("\n── IMAGES ──")
+            lines.append("\n-- IMAGES --")
             for el in imgs[:10]:
                 src = (await el.get_attribute("src") or "")[:80]
                 lines.append(
@@ -327,13 +317,12 @@ async def debug_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"class='{await el.get_attribute('class')}' "
                     f"src='{src}'"
                 )
-
-            lines.append(f"\n── reCAPTCHA site-key: {rckey or 'NOT FOUND'} ──")
+            lines.append(f"\n-- reCAPTCHA site-key: {rckey or 'NOT FOUND'} --")
 
             report = "\n".join(lines)
             await update.message.reply_text(f"```\n{report[:3800]}\n```", parse_mode="Markdown")
             with open(debug_path, "rb") as f:
-                await update.message.reply_photo(f, caption="Скриншот DL Check page")
+                await update.message.reply_photo(f, caption="DL Check page screenshot")
 
         except Exception as e:
             await update.message.reply_text(f"Debug error: {e}")
@@ -343,9 +332,7 @@ async def debug_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 os.remove(debug_path)
 
 
-# ─────────────────────────────────────────────────────────────
-#  BULK CHECK HANDLER
-# ─────────────────────────────────────────────────────────────
+# HANDLERS
 async def handle_bulk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = getattr(update.effective_user, "id", None)
     if uid not in ALLOWED_IDS:
@@ -357,7 +344,9 @@ async def handle_bulk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for line in update.message.text.strip().split("\n"):
         parts = line.strip().split()
         if len(parts) < 2:
-            await update.message.reply_text(f"❌ Неверный формат: '{line}'\nОжидается: ИМЯ ФАМИЛИЯ НОМЕР")
+            await update.message.reply_text(
+                f"\u274c Wrong format: '{line}'\nExpected: FIRSTNAME LASTNAME LICENSENUMBER"
+            )
             continue
         cdl_number  = parts[-1]
         driver_name = " ".join(parts[:-1])
@@ -369,12 +358,10 @@ async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def deny(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.warning(f"Blocked uid={getattr(update.effective_user,'id',None)}")
+    logger.warning(f"Blocked uid={getattr(update.effective_user, 'id', None)}")
 
 
-# ─────────────────────────────────────────────────────────────
-#  MAIN
-# ─────────────────────────────────────────────────────────────
+# MAIN
 def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("myid",  cmd_myid))
