@@ -109,7 +109,9 @@ async def parse_fl_result(page):
     try:
         text = " ".join(l.strip() for l in (await page.inner_text("body")).splitlines() if l.strip())
 
-        if re.search(r"\bis\s+valid\b", text, re.I):
+        if re.search(r"Invalid DL/ID Number", text, re.I):
+            status = "\u274c INVALID DL/ID NUMBER\nCheck that the license number and state are correct."
+        elif re.search(r"\bis\s+valid\b", text, re.I):
             status = "\u2705 STATUS: VALID \u2705"
         elif re.search(r"\b(cancelled|suspended|revoked|disqualified|withdrawn)\b", text, re.I):
             status = "\U0001f6a8 STATUS: INVALID / ACTION REQUIRED \U0001f6a8"
@@ -329,7 +331,11 @@ async def check_cdl(driver_name, cdl_number, state, update):
                 await update.message.reply_text(f"\u274c {state} {cdl_number}: Submit button not found. Run /debug{state.lower()}")
                 return
             await submit.click()
-            await page.wait_for_timeout(3000)
+            # Wait for navigation or network idle after submit
+            try:
+                await page.wait_for_load_state("networkidle", timeout=15000)
+            except PlaywrightTimeout:
+                await page.wait_for_timeout(4000)  # fallback fixed wait
 
             # 5. Screenshot + parse
             result_path = os.path.join(tempfile.gettempdir(), f"result_{state}_{cdl_number}.png")
